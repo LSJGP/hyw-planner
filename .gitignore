@@ -1,0 +1,9 @@
+# Bazel
+bazel-*
+external/
+
+# IDE / clangd
+compile_commands.json
+.vscode/
+.idea/
+.cursor/
