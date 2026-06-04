@@ -1,3 +1,7 @@
-build --enable_bzlmod=false
+try-import %workspace%/../.bazelrc.cache
+
+common --enable_bzlmod=false
 build --cxxopt=-std=c++17
 build --spawn_strategy=local
+
+try-import %workspace%/.bazelrc.local
