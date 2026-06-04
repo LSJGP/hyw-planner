@@ -34,9 +34,10 @@ local_repository(
     path = "../hyw-proto",
 )
 
-load("@hyw_proto//third_party:hyw_apple_rules_fix.bzl", "hyw_apple_rules_fix")
+load("@hyw_proto//third_party:hyw_grpc_deps.bzl", "hyw_grpc_deps")
 
-hyw_apple_rules_fix()
+# grpc_deps() defaults to rules_apple 0.32.0; pin Bazel-7-compatible versions first.
+hyw_grpc_deps()
 
 load("@rules_proto_grpc//:repositories.bzl", "rules_proto_grpc_repos", "rules_proto_grpc_toolchains")
 
