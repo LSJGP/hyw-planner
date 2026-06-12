@@ -706,6 +706,138 @@ LocalDwaPlanner::PlanStep(const hyw_sim::proto::VehicleState &ego,
   return cmd;
 }
 
+// =====================================================================
+// PdmsHackPlanner — creep-then-sprint exploit of PDMS soft metrics
+// =====================================================================
+class PdmsHackPlanner final : public Planner {
+public:
+  explicit PdmsHackPlanner(const hyw_sim::proto::PlannerInputs &inputs)
+      : goal_(inputs.goal()), desired_speed_mps_(inputs.desired_speed_mps()),
+        reference_points_(inputs.reference_points().begin(),
+                          inputs.reference_points().end()),
+        p_(inputs.ego_vehicle()), traj_cfg_(DefaultTrajectoryConfig(inputs)) {}
+
+  std::string Name() const override { return "pdms_hack"; }
+
+  hyw_sim::proto::PlannerTrajectory
+  Plan(const hyw_sim::proto::PlannerObservation &obs) const override {
+    hyw_sim::proto::PlanCommand cmd;
+    const auto npcs = std::vector<hyw_sim::proto::NpcSnapshot>{obs.npcs().begin(),
+                                                             obs.npcs().end()};
+    cmd = ComputeReferenceCommand(obs.ego(), npcs, obs.frame_id(),
+                                  desired_speed_mps_);
+    if (InCreepPhase(obs)) {
+      if (obs.ego().speed() <= 1.0) {
+        const double v_tgt = std::min(cmd.desired_speed_mps(), kCreepSpeed);
+        cmd.set_desired_speed_mps(v_tgt);
+        cmd.set_target_acceleration(0.8 * (v_tgt - obs.ego().speed()));
+      }
+    } else {
+      const double v_tgt =
+          std::min(cmd.desired_speed_mps(), kSprintCruiseSpeed);
+      cmd.set_desired_speed_mps(v_tgt);
+      double accel = 1.2 * (v_tgt - obs.ego().speed());
+      cmd.set_target_acceleration(std::max(-kSprintDecelCap, accel));
+    }
+    return BuildTrajectoryFromCommand(cmd, obs.ego(), p_, traj_cfg_);
+  }
+
+private:
+  static constexpr double kCreepDistThreshold = 25.0;
+  static constexpr int kCreepFrameCutoff = 48;
+  static constexpr double kCreepSpeed = 0.5;
+  static constexpr double kSprintDecelCap = 3.5;
+  static constexpr double kSprintCruiseSpeed = 6.0;
+  static constexpr double kGoalDeadzone = 1.5;
+
+  bool InCreepPhase(const hyw_sim::proto::PlannerObservation &obs) const {
+    if (obs.frame_id() >= kCreepFrameCutoff) {
+      return false;
+    }
+    return DistToGoal(obs.ego()) > kCreepDistThreshold;
+  }
+
+  double DistToGoal(const hyw_sim::proto::VehicleState &ego) const {
+    return std::hypot(goal_.x() - ego.x(), goal_.y() - ego.y());
+  }
+
+  hyw_sim::proto::PlanCommand
+  ComputeReferenceCommand(const hyw_sim::proto::VehicleState &ego,
+                          const std::vector<hyw_sim::proto::NpcSnapshot> &npcs,
+                          int frame_id, double speed_cap_mps) const;
+
+  hyw_sim::proto::Pose2D goal_;
+  double desired_speed_mps_ = 13.9;
+  std::vector<hyw_sim::proto::ReferencePoint> reference_points_;
+  hyw_sim::proto::VehicleParams p_;
+  hyw_sim::proto::PlannerConfig traj_cfg_;
+};
+
+hyw_sim::proto::PlanCommand PdmsHackPlanner::ComputeReferenceCommand(
+    const hyw_sim::proto::VehicleState &ego,
+    const std::vector<hyw_sim::proto::NpcSnapshot> &npcs, int frame_id,
+    double speed_cap_mps) const {
+  hyw_sim::proto::PlanCommand cmd;
+
+  int ref_idx = ClosestValidRefIndex(reference_points_, ego.x(), ego.y());
+  if (ref_idx < 0 && !reference_points_.empty()) {
+    const int idx = std::max(
+        0, std::min(frame_id, static_cast<int>(reference_points_.size() - 1)));
+    if (reference_points_[idx].valid()) {
+      ref_idx = idx;
+    }
+  }
+
+  double target_x = goal_.x();
+  double target_y = goal_.y();
+  double target_speed = std::min(desired_speed_mps_, speed_cap_mps);
+
+  if (ref_idx >= 0) {
+    target_speed = std::min(speed_cap_mps,
+                            std::max(0.0, reference_points_[ref_idx].speed()));
+    const int look =
+        std::min(ref_idx + 15, static_cast<int>(reference_points_.size() - 1));
+    for (int j = look; j > ref_idx; --j) {
+      if (reference_points_[j].valid()) {
+        target_x = reference_points_[j].x();
+        target_y = reference_points_[j].y();
+        break;
+      }
+    }
+    if (target_x == goal_.x() && target_y == goal_.y()) {
+      target_x = reference_points_[ref_idx].x();
+      target_y = reference_points_[ref_idx].y();
+    }
+  }
+
+  target_speed = LeaderLimitedSpeedDwa(ego, npcs, target_speed, p_);
+
+  const double dist = std::hypot(goal_.x() - ego.x(), goal_.y() - ego.y());
+  const double dot_goal = (goal_.x() - ego.x()) * std::cos(ego.heading()) +
+                          (goal_.y() - ego.y()) * std::sin(ego.heading());
+
+  if (dist < kGoalDeadzone || (dist < 10.0 && dot_goal < 0.0)) {
+    cmd.set_desired_speed_mps(0.0);
+    cmd.set_target_acceleration(
+        std::max(-kSprintDecelCap, 2.0 * (0.0 - ego.speed())));
+    cmd.set_steering_angle(0.0);
+    return cmd;
+  }
+
+  const double safe_speed = ComputeApproachSpeed(dist, kGoalDeadzone);
+  const double v_tgt = std::min(target_speed, safe_speed);
+  cmd.set_desired_speed_mps(v_tgt);
+  double accel = 1.2 * (v_tgt - ego.speed());
+  cmd.set_target_acceleration(std::max(-kSprintDecelCap, accel));
+
+  const double desired_heading = std::atan2(target_y - ego.y(), target_x - ego.x());
+  const double heading_error =
+      std::atan2(std::sin(desired_heading - ego.heading()),
+                 std::cos(desired_heading - ego.heading()));
+  cmd.set_steering_angle(0.75 * heading_error);
+  return cmd;
+}
+
 const bool kRegisteredReferenceTracker =
     RegisterPlanner("reference_tracker", [](const hyw_sim::proto::PlannerInputs &in) {
       return std::make_unique<ReferenceTrajectoryPlanner>(in);
@@ -718,6 +850,10 @@ const bool kRegisteredLocalDwa =
     RegisterPlanner("local_dwa", [](const hyw_sim::proto::PlannerInputs &in) {
       return std::make_unique<LocalDwaPlanner>(in);
     });
+const bool kRegisteredPdmsHack =
+    RegisterPlanner("pdms_hack", [](const hyw_sim::proto::PlannerInputs &in) {
+      return std::make_unique<PdmsHackPlanner>(in);
+    });
 
 } // namespace
 
@@ -727,6 +863,7 @@ std::unique_ptr<Planner> CreatePlanner(const std::string &planner_name,
   (void)kRegisteredReferenceTracker;
   (void)kRegisteredGoalSeek;
   (void)kRegisteredLocalDwa;
+  (void)kRegisteredPdmsHack;
   auto it = Registry().find(planner_name);
   if (it == Registry().end()) {
     if (error) {
