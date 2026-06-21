@@ -19,12 +19,34 @@ bazel run //cpp:planner_server -- --port 50051
 
 ## 内置 planner
 
-| 名称 | 说明 |
-|------|------|
-| `reference_tracker` | 沿地图参考线跟踪 |
-| `goal_seek` | 朝 goal 直线趋近 |
-| `local_dwa` | 局部 DWA，带前车限速与路沿偏置 |
-| `pdms_hack` | 针对 PDMS 评分的红队 planner（见下文） |
+
+| 名称                  | 说明                                        |
+| ------------------- | ----------------------------------------- |
+| `reference_tracker` | 沿地图参考线跟踪                                  |
+| `goal_seek`         | 朝 goal 直线趋近                               |
+| `local_dwa`         | 局部 DWA，带前车限速与路沿偏置                         |
+| `pdms_hack`         | 针对 PDMS 评分的红队 planner（见下文）                |
+| `nc_exempt_trainer` | NC 豁免训练用红队 planner：低速守线、DWA 忽略后方 NPC（见下文） |
+
+
+---
+
+## `nc_exempt_trainer` — NC 豁免训练 planner
+
+实验性 planner，**故意弱化避障**以在仿真中尽可能制造「NPC 后方追尾 ego」类碰撞，供 `regulatory_collision_checker` 的 `rear_end_on_slow_ego` 等豁免规则迭代。**不可部署**，仅用于 offline grading 训练。
+
+实现位于 `cpp/core/planner.cc` 的 `NcExemptTrainerPlanner`，相对 `local_dwa` 的主要差异：
+
+
+| 行为       | 说明                                                |
+| -------- | ------------------------------------------------- |
+| 低速巡航     | 距 goal > 15 m 时速度上限 3.5 m/s（满足 ego < 5 m/s 豁免前提）  |
+| 弱化前车限速   | `LeaderLimitedSpeedRelaxed`：更短触发距离、更小净距           |
+| DWA 忽略后方 | rollout 碰撞检测跳过 ego 后方 NPC                         |
+| 后方威胁     | 检测到后方快速接近 NPC 时**主动制动至 ~2.5 m/s**（非仅禁止加速），保持低速等追尾 |
+
+
+用法与 `pdms_hack` 相同：`--planner nc_exempt_trainer`，建议配合 `metrics_collision_only.json` 批跑。
 
 ---
 
@@ -36,7 +58,7 @@ bazel run //cpp:planner_server -- --port 50051
 
 ### 设计动机
 
-PDMS 由硬性惩罚项与软性加权项相乘得到（详见仓库根目录 [`pdms_guide.md`](../pdms_guide.md)）：
+PDMS 由硬性惩罚项与软性加权项相乘得到（详见仓库根目录 `[pdms_guide.md](../pdms_guide.md)`）：
 
 ```
 PDMS = (NC × DAC × SL) × weighted_avg(EP, TTC, C, Speed)
@@ -73,14 +95,16 @@ PDMS = (NC × DAC × SL) × weighted_avg(EP, TTC, C, Speed)
 
 关键参数（`planner.cc` 内 `constexpr`）：
 
-| 参数 | 值 | 含义 |
-|------|-----|------|
-| `kCreepFrameCutoff` | 48 | 超过该帧号强制退出磨蹭阶段 |
-| `kCreepDistThreshold` | 25 m | 距 goal 小于此值进入冲刺 |
-| `kCreepSpeed` | 0.5 m/s | 磨蹭阶段速度上限 |
-| `kSprintCruiseSpeed` | 6.0 m/s | 冲刺阶段巡航上限 |
-| `kSprintDecelCap` | 3.5 m/s² | 冲刺阶段最大减速度（低于 Comfort 4.0 阈值） |
-| `kGoalDeadzone` | 1.5 m | 进入 goal 邻域后停车 |
+
+| 参数                    | 值        | 含义                           |
+| --------------------- | -------- | ---------------------------- |
+| `kCreepFrameCutoff`   | 48       | 超过该帧号强制退出磨蹭阶段                |
+| `kCreepDistThreshold` | 25 m     | 距 goal 小于此值进入冲刺              |
+| `kCreepSpeed`         | 0.5 m/s  | 磨蹭阶段速度上限                     |
+| `kSprintCruiseSpeed`  | 6.0 m/s  | 冲刺阶段巡航上限                     |
+| `kSprintDecelCap`     | 3.5 m/s² | 冲刺阶段最大减速度（低于 Comfort 4.0 阈值） |
+| `kGoalDeadzone`       | 1.5 m    | 进入 goal 邻域后停车                |
+
 
 早期版本在仿真起始就强制低速，容易触发 NC 碰撞；当前实现**仅在 ego 已自然减速到 ≤ 1 m/s 后才启用磨蹭钳制**，避免起步阶段与 NPC 纠缠。
 
@@ -109,15 +133,17 @@ python run_sim.py \
 
 以下数据来自同一场景、同一评分配置的两次离线 grading 报告：
 
-| | `local_dwa` | `pdms_hack` |
-|---|-------------|-------------|
-| 报告目录 | `hyw-workbench/dwa_info/20260612_170854_waymo_scenario_0/` | `hyw-workbench/hack_info/20260612_170446_waymo_scenario_0/` |
-| **PDMS** | **0.885 FAIL** | **0.950 PASS** |
-| NC / DAC / SL | 1 / 1 / 1 | 1 / 1 / 1 |
-| EP（末帧） | 0.894 | 0.898 |
-| TTC（通过率） | 0.844（14/90 风险帧） | 0.978（2/90 风险帧） |
-| C（通过率） | 0.933（6/90 急刹帧） | 1.000（0/90） |
-| Speed | 1 | 1 |
+
+|               | `local_dwa`                                                | `pdms_hack`                                                 |
+| ------------- | ---------------------------------------------------------- | ----------------------------------------------------------- |
+| 报告目录          | `hyw-workbench/dwa_info/20260612_170854_waymo_scenario_0/` | `hyw-workbench/hack_info/20260612_170446_waymo_scenario_0/` |
+| **PDMS**      | **0.885 FAIL**                                             | **0.950 PASS**                                              |
+| NC / DAC / SL | 1 / 1 / 1                                                  | 1 / 1 / 1                                                   |
+| EP（末帧）        | 0.894                                                      | 0.898                                                       |
+| TTC（通过率）      | 0.844（14/90 风险帧）                                           | 0.978（2/90 风险帧）                                             |
+| C（通过率）        | 0.933（6/90 急刹帧）                                            | 1.000（0/90）                                                 |
+| Speed         | 1                                                          | 1                                                           |
+
 
 两者均未发生真实碰撞（NC = 1），也均未越界/压实线；差距集中在**软指标帧通过率**，而非硬性一票否决项。
 
@@ -186,12 +212,14 @@ TTC 通过率 0.844 → 0.978，是 PDMS 提升的主要来源。
 
 两份 `waymo_scenario_0_sim_log.json` 的平均速度接近（dwa 8.76 m/s，hack 8.78 m/s），但**时序分布**不同：
 
-| 时刻 | `local_dwa` 速度 | `pdms_hack` 速度 |
-|------|------------------|------------------|
-| t = 0 s | 5.66 m/s | 6.51 m/s |
-| t = 3 s | **12.06 m/s**（TTC 风险簇） | 12.56 m/s |
-| t = 4.8 s | 11.06 m/s | 10.46 m/s |
-| t = 8.9 s | 2.77 m/s（末段急刹） | 3.71 m/s |
+
+| 时刻        | `local_dwa` 速度         | `pdms_hack` 速度 |
+| --------- | ---------------------- | -------------- |
+| t = 0 s   | 5.66 m/s               | 6.51 m/s       |
+| t = 3 s   | **12.06 m/s**（TTC 风险簇） | 12.56 m/s      |
+| t = 4.8 s | 11.06 m/s              | 10.46 m/s      |
+| t = 8.9 s | 2.77 m/s（末段急刹）         | 3.71 m/s       |
+
 
 `local_dwa` 在中段维持更高巡航并伴随更猛的加减速；`pdms_hack` 通过减速度上限和更保守的跟车限速，减少了 TTC/C 违规帧，末帧 EP 仅略高（`alongRatio` 0.946 vs 0.948）。
 
@@ -208,6 +236,7 @@ TTC 通过率 0.844 → 0.978，是 PDMS 提升的主要来源。
 
 ### 相关文档
 
-- PDMS 公式与子指标：[`pdms_guide.md`](../pdms_guide.md)
-- 各 checker 实现细节：[`hyw-grading/features.md`](../hyw-grading/features.md)
+- PDMS 公式与子指标：`[pdms_guide.md](../pdms_guide.md)`
+- 各 checker 实现细节：`[hyw-grading/features.md](../hyw-grading/features.md)`
 - 源码：`cpp/core/planner.cc` → `PdmsHackPlanner`
+

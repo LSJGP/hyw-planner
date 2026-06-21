@@ -215,6 +215,77 @@ double LeaderLimitedSpeedDwa(const hyw_sim::proto::VehicleState &ego,
   }
   return safe_speed;
 }
+
+double LeaderLimitedSpeedRelaxed(
+    const hyw_sim::proto::VehicleState &ego,
+    const std::vector<hyw_sim::proto::NpcSnapshot> &npcs,
+    double desired_speed_mps, const hyw_sim::proto::VehicleParams &p) {
+  double safe_speed = desired_speed_mps;
+  constexpr double kTimeHeadway = 0.8;
+  constexpr double kMinGap = 1.5;
+  constexpr double kTriggerGap = 4.0;
+  const double ego_half = p.length() * 0.5 + 0.35;
+  for (const auto &n : npcs) {
+    const double dx = n.x() - ego.x();
+    const double dy = n.y() - ego.y();
+    const double c = std::cos(-ego.heading());
+    const double s = std::sin(-ego.heading());
+    const double fx = c * dx - s * dy;
+    const double fy = s * dx + c * dy;
+    if (fx < 0.0 || fx > 60.0)
+      continue;
+    if (std::fabs(fy) > (1.8 + 0.5 * n.width()))
+      continue;
+    const double gap = std::max(0.1, fx - 0.5 * n.length() - ego_half);
+    const double npc_speed = std::hypot(n.vx(), n.vy());
+    if (gap < kTriggerGap) {
+      const double comfortable =
+          std::max(0.0, (gap - kMinGap) / std::max(0.5, kTimeHeadway));
+      safe_speed =
+          std::min(safe_speed, std::max(0.0, std::min(npc_speed, comfortable)));
+    }
+  }
+  return safe_speed;
+}
+
+bool NpcInFrontHemisphere(const hyw_sim::proto::VehicleState &ego,
+                          const hyw_sim::proto::NpcSnapshot &n,
+                          double rear_margin_m) {
+  const double dx = n.x() - ego.x();
+  const double dy = n.y() - ego.y();
+  const double c = std::cos(-ego.heading());
+  const double s = std::sin(-ego.heading());
+  const double fx = c * dx - s * dy;
+  return fx > rear_margin_m;
+}
+
+bool DetectRearThreat(const hyw_sim::proto::VehicleState &ego,
+                      const std::vector<hyw_sim::proto::NpcSnapshot> &npcs,
+                      const hyw_sim::proto::VehicleParams &p,
+                      double range_m, double rel_speed_min_mps) {
+  const double ego_half = p.length() * 0.5 + 0.35;
+  for (const auto &n : npcs) {
+    const double dx = n.x() - ego.x();
+    const double dy = n.y() - ego.y();
+    const double c = std::cos(-ego.heading());
+    const double s = std::sin(-ego.heading());
+    const double fx = c * dx - s * dy;
+    const double fy = s * dx + c * dy;
+    if (fx >= 0.0)
+      continue;
+    if (std::fabs(fy) > (1.8 + 0.5 * n.width()))
+      continue;
+    const double rear_gap =
+        std::max(0.0, -fx - 0.5 * n.length() - ego_half);
+    if (rear_gap > range_m)
+      continue;
+    const double npc_speed = std::hypot(n.vx(), n.vy());
+    if (npc_speed - ego.speed() > rel_speed_min_mps)
+      return true;
+  }
+  return false;
+}
+
 // 【终极修复 1】根据距离动态计算安全接近速度 (基于 v^2 = 2ad)
 double ComputeApproachSpeed(double dist, double deadzone) {
   constexpr double kComfortableDecel = 1.5; // 期望的舒适减速度 1.5 m/s^2
@@ -707,6 +778,288 @@ LocalDwaPlanner::PlanStep(const hyw_sim::proto::VehicleState &ego,
 }
 
 // =====================================================================
+// NcExemptTrainerPlanner — slow crawl + ignore rear NPC in DWA for NC exempt training
+// =====================================================================
+class NcExemptTrainerPlanner final : public Planner {
+public:
+  explicit NcExemptTrainerPlanner(const hyw_sim::proto::PlannerInputs &inputs)
+      : goal_(inputs.goal()), desired_speed_mps_(inputs.desired_speed_mps()),
+        reference_points_(inputs.reference_points().begin(),
+                          inputs.reference_points().end()),
+        p_(inputs.ego_vehicle()), traj_cfg_(DefaultTrajectoryConfig(inputs)) {}
+
+  std::string Name() const override { return "nc_exempt_trainer"; }
+
+  hyw_sim::proto::PlannerTrajectory
+  Plan(const hyw_sim::proto::PlannerObservation &obs) const override {
+    const auto cmd =
+        PlanStep(obs.ego(), {obs.npcs().begin(), obs.npcs().end()},
+                 obs.frame_id(), obs.road());
+    return BuildTrajectoryFromCommand(cmd, obs.ego(), p_, traj_cfg_);
+  }
+
+private:
+  static constexpr double kRollDt = 0.05;
+  static constexpr int kHorizonSteps = 12;
+  static constexpr double kNpcInflate = 0.15;
+  static constexpr double kCrawlSpeedCap = 3.5;
+  static constexpr double kCrawlDistThreshold = 15.0;
+  static constexpr double kRearThreatRangeM = 15.0;
+  static constexpr double kRearThreatRelSpeedMin = 2.0;
+  static constexpr double kRearDwaMarginM = -1.0;
+  static constexpr double kProgWeight = 0.4;
+  static constexpr double kRearHoldSpeedMps = 2.5;
+  static constexpr double kRearBrakeGain = 1.8;
+  static constexpr double kCrawlAccelGain = 1.2;
+
+  hyw_sim::proto::PlanCommand PlanStep(const hyw_sim::proto::VehicleState &ego,
+                              const std::vector<hyw_sim::proto::NpcSnapshot> &npcs,
+                              int frame_id,
+                              const hyw_sim::proto::RoadContext &road) const;
+  hyw_sim::proto::PlanCommand FallbackPurePursuit(const hyw_sim::proto::VehicleState &ego,
+                                         double target_x, double target_y,
+                                         double target_speed,
+                                         const hyw_sim::proto::RoadContext &road) const;
+
+  hyw_sim::proto::Pose2D goal_;
+  double desired_speed_mps_ = 13.9;
+  std::vector<hyw_sim::proto::ReferencePoint> reference_points_;
+  hyw_sim::proto::VehicleParams p_;
+  hyw_sim::proto::PlannerConfig traj_cfg_;
+};
+
+hyw_sim::proto::PlanCommand
+NcExemptTrainerPlanner::FallbackPurePursuit(
+    const hyw_sim::proto::VehicleState &ego, double target_x, double target_y,
+    double target_speed, const hyw_sim::proto::RoadContext &road) const {
+  hyw_sim::proto::PlanCommand cmd;
+  const double dx_goal = goal_.x() - ego.x();
+  const double dy_goal = goal_.y() - ego.y();
+  const double dist_goal = std::hypot(dx_goal, dy_goal);
+  const double dot_goal = dx_goal * std::cos(ego.heading()) +
+                          dy_goal * std::sin(ego.heading());
+  constexpr double kGoalDeadzone = 1.5;
+
+  if (dist_goal < kGoalDeadzone || (dist_goal < 10.0 && dot_goal < 0.0)) {
+    hyw_sim::proto::PlanCommand stop_cmd;
+    stop_cmd.set_desired_speed_mps(0.0);
+    stop_cmd.set_target_acceleration(
+        std::max(-p_.max_decel(), 2.0 * (0.0 - ego.speed())));
+    stop_cmd.set_steering_angle(0.0);
+    return stop_cmd;
+  }
+
+  double safe_speed = ComputeApproachSpeed(dist_goal, kGoalDeadzone);
+  double v_tgt = std::min(target_speed, safe_speed);
+  cmd.set_desired_speed_mps(v_tgt);
+  cmd.set_target_acceleration(1.2 * (v_tgt - ego.speed()));
+
+  const double dx_target = target_x - ego.x();
+  const double dy_target = target_y - ego.y();
+  const double desired_heading = std::atan2(dy_target, dx_target);
+  const double heading_error =
+      std::atan2(std::sin(desired_heading - ego.heading()),
+                 std::cos(desired_heading - ego.heading()));
+  double steer = 0.85 * heading_error;
+  if (road.closest_lane_id() != 0) {
+    steer -= 0.4 * road.lateral_offset_m();
+    steer = std::clamp(steer, -p_.max_steer(), p_.max_steer());
+  }
+  cmd.set_steering_angle(steer);
+  return cmd;
+}
+
+hyw_sim::proto::PlanCommand NcExemptTrainerPlanner::PlanStep(
+    const hyw_sim::proto::VehicleState &ego,
+    const std::vector<hyw_sim::proto::NpcSnapshot> &npcs, int frame_id,
+    const hyw_sim::proto::RoadContext &road) const {
+  constexpr int kSteerSamples = 13;
+  constexpr int kAccelSamples = 7;
+  constexpr double kGoalDeadzone = 1.5;
+
+  const double dx_goal = goal_.x() - ego.x();
+  const double dy_goal = goal_.y() - ego.y();
+  const double dist_goal = std::hypot(dx_goal, dy_goal);
+  const double dot_goal =
+      dx_goal * std::cos(ego.heading()) + dy_goal * std::sin(ego.heading());
+
+  if (dist_goal < kGoalDeadzone || (dist_goal < 10.0 && dot_goal < 0.0)) {
+    hyw_sim::proto::PlanCommand stop_cmd;
+    stop_cmd.set_desired_speed_mps(0.0);
+    stop_cmd.set_target_acceleration(
+        std::max(-p_.max_decel(), 2.0 * (0.0 - ego.speed())));
+    stop_cmd.set_steering_angle(0.0);
+    return stop_cmd;
+  }
+
+  const int min_ref_idx = std::max(0, frame_id - 3);
+  int ref_idx =
+      ClosestValidRefIndexFrom(reference_points_, ego.x(), ego.y(), min_ref_idx);
+  if (ref_idx < 0) {
+    ref_idx = ClosestValidRefIndex(reference_points_, ego.x(), ego.y());
+  }
+  if (ref_idx < 0 && !reference_points_.empty()) {
+    const int idx = std::max(
+        0, std::min(frame_id, static_cast<int>(reference_points_.size() - 1)));
+    if (reference_points_[idx].valid())
+      ref_idx = idx;
+  }
+  if (ref_idx >= 0 && ref_idx < min_ref_idx) {
+    ref_idx = min_ref_idx;
+  }
+
+  double target_speed = desired_speed_mps_;
+  if (ref_idx >= 0) {
+    target_speed = std::min(desired_speed_mps_,
+                            std::max(0.0, reference_points_[ref_idx].speed()));
+  }
+  target_speed = LeaderLimitedSpeedRelaxed(ego, npcs, target_speed, p_);
+  if (dist_goal > kCrawlDistThreshold) {
+    target_speed = std::min(target_speed, kCrawlSpeedCap);
+  }
+
+  const bool rear_threat = DetectRearThreat(ego, npcs, p_, kRearThreatRangeM,
+                                            kRearThreatRelSpeedMin);
+  if (rear_threat) {
+    target_speed = std::min(target_speed, kRearHoldSpeedMps);
+  }
+
+  double tx = std::cos(ego.heading());
+  double ty = std::sin(ego.heading());
+  if (ref_idx >= 0 && RefTangent(reference_points_, ref_idx, tx, ty)) {
+  } else if (dist_goal > 1e-3) {
+    tx = dx_goal / dist_goal;
+    ty = dy_goal / dist_goal;
+  }
+
+  double target_x = ego.x() + tx * 12.0;
+  double target_y = ego.y() + ty * 12.0;
+  if (ref_idx >= 0) {
+    const int look =
+        std::min(ref_idx + 15, static_cast<int>(reference_points_.size() - 1));
+    for (int j = look; j > ref_idx; --j) {
+      if (reference_points_[j].valid()) {
+        target_x = reference_points_[j].x();
+        target_y = reference_points_[j].y();
+        break;
+      }
+    }
+  } else if (dist_goal > 1e-3) {
+    target_x = goal_.x();
+    target_y = goal_.y();
+  }
+
+  double best_cost = 1e300;
+  double best_steer = 0.0;
+  int best_first_hit = -1;
+  bool found_free = false;
+
+  for (int ai = 0; ai < kAccelSamples; ++ai) {
+    const double t_a =
+        static_cast<double>(ai) / static_cast<double>(kAccelSamples - 1);
+    const double accel =
+        -p_.max_decel() + t_a * (p_.max_accel() + p_.max_decel());
+
+    for (int si = 0; si < kSteerSamples; ++si) {
+      const double t_s =
+          static_cast<double>(si) / static_cast<double>(kSteerSamples - 1);
+      const double steer_cmd = -p_.max_steer() + t_s * (2.0 * p_.max_steer());
+
+      hyw_sim::proto::VehicleState roll;
+      roll.CopyFrom(ego);
+      int first_hit = kHorizonSteps + 1;
+      bool hit = false;
+      for (int h = 0; h < kHorizonSteps; ++h) {
+        SimulateOneStep(roll, accel, steer_cmd, kRollDt, p_);
+        const double t_npc = static_cast<double>(h + 1) * kRollDt;
+        const OBB ego_b = MakeEgoObb(roll, p_, 0.08);
+        for (const auto &n : npcs) {
+          if (!NpcInFrontHemisphere(ego, n, kRearDwaMarginM))
+            continue;
+          const OBB nb = MakeNpcObbAt(n, t_npc, kNpcInflate);
+          if (Overlap(ego_b, nb)) {
+            first_hit = h;
+            hit = true;
+            break;
+          }
+        }
+        if (hit)
+          break;
+      }
+
+      const double prog = (roll.x() - ego.x()) * tx + (roll.y() - ego.y()) * ty;
+      const double lat_err =
+          std::fabs(-ty * (roll.x() - ego.x()) + tx * (roll.y() - ego.y()));
+      const double ref_lat =
+          RefPathLateralError(reference_points_, roll.x(), roll.y(), ref_idx);
+      double lane_cost = 0.55 * lat_err + 1.1 * ref_lat;
+      if (road.closest_lane_id() != 0) {
+        const double dlat_path =
+            -ty * (roll.x() - ego.x()) + tx * (roll.y() - ego.y());
+        const double pred_lat = road.lateral_offset_m() + dlat_path;
+        lane_cost += 2.0 * LaneOffsetPenalty(pred_lat);
+        const double pred_left_b = road.dist_to_left_boundary_m() - dlat_path;
+        const double pred_right_b = road.dist_to_right_boundary_m() + dlat_path;
+        lane_cost += LaneBoundaryPenalty(pred_left_b, pred_right_b);
+      }
+      const double cost_track = lane_cost - kProgWeight * prog +
+                                0.35 * std::fabs(steer_cmd) +
+                                0.04 * std::fabs(accel);
+
+      if (!hit) {
+        if (!found_free || cost_track < best_cost - 1e-9 ||
+            (std::fabs(cost_track - best_cost) < 1e-9 &&
+             std::fabs(steer_cmd) < std::fabs(best_steer))) {
+          found_free = true;
+          best_cost = cost_track;
+          best_steer = steer_cmd;
+          best_first_hit = kHorizonSteps + 1;
+        }
+      } else if (!found_free) {
+        if (best_first_hit < 0 || first_hit > best_first_hit ||
+            (first_hit == best_first_hit && cost_track < best_cost)) {
+          best_cost = cost_track;
+          best_steer = steer_cmd;
+          best_first_hit = first_hit;
+        }
+      }
+    }
+  }
+
+  if (!found_free) {
+    return FallbackPurePursuit(ego, target_x, target_y, target_speed, road);
+  }
+
+  hyw_sim::proto::PlanCommand cmd;
+  double safe_speed = ComputeApproachSpeed(dist_goal, kGoalDeadzone);
+
+  if (ego.speed() > safe_speed || dist_goal < 10.0) {
+    double v_tgt = std::min(target_speed, safe_speed);
+    cmd.set_target_acceleration(1.5 * (v_tgt - ego.speed()));
+    cmd.set_desired_speed_mps(v_tgt);
+  } else {
+    const double v_crawl = std::min(target_speed, kCrawlSpeedCap);
+    cmd.set_target_acceleration(kCrawlAccelGain * (v_crawl - ego.speed()));
+    cmd.set_desired_speed_mps(v_crawl);
+  }
+
+  if (rear_threat) {
+    const double rear_accel = kRearBrakeGain * (kRearHoldSpeedMps - ego.speed());
+    cmd.set_target_acceleration(std::min(cmd.target_acceleration(), rear_accel));
+    cmd.set_desired_speed_mps(std::min(cmd.desired_speed_mps(), kRearHoldSpeedMps));
+  }
+
+  double steer = best_steer;
+  if (road.closest_lane_id() != 0 &&
+      std::fabs(road.lateral_offset_m()) > 0.35) {
+    steer -= 0.25 * road.lateral_offset_m();
+    steer = std::clamp(steer, -p_.max_steer(), p_.max_steer());
+  }
+  cmd.set_steering_angle(steer);
+  return cmd;
+}
+
+// =====================================================================
 // PdmsHackPlanner — creep-then-sprint exploit of PDMS soft metrics
 // =====================================================================
 class PdmsHackPlanner final : public Planner {
@@ -854,6 +1207,10 @@ const bool kRegisteredPdmsHack =
     RegisterPlanner("pdms_hack", [](const hyw_sim::proto::PlannerInputs &in) {
       return std::make_unique<PdmsHackPlanner>(in);
     });
+const bool kRegisteredNcExemptTrainer =
+    RegisterPlanner("nc_exempt_trainer", [](const hyw_sim::proto::PlannerInputs &in) {
+      return std::make_unique<NcExemptTrainerPlanner>(in);
+    });
 
 } // namespace
 
@@ -864,6 +1221,7 @@ std::unique_ptr<Planner> CreatePlanner(const std::string &planner_name,
   (void)kRegisteredGoalSeek;
   (void)kRegisteredLocalDwa;
   (void)kRegisteredPdmsHack;
+  (void)kRegisteredNcExemptTrainer;
   auto it = Registry().find(planner_name);
   if (it == Registry().end()) {
     if (error) {
